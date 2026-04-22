@@ -27,30 +27,39 @@ async function getTenantAccessToken(env) {
   return data.tenant_access_token;
 }
 
+// Single-parent variant (fallback only). Uses `eq`, validated in prior runs.
 async function filterChildren(token, parentOpenId) {
+  return filterChildrenByParents(token, [parentOpenId], true);
+}
+
+// Batch-parents variant. `in` operator lets us ask many parents at once so BFS
+// costs one request per tree level instead of one per internal node. Falls back
+// to per-parent `eq` loop if `in` is rejected.
+async function filterChildrenByParents(token, parentOpenIds, singleEq = false) {
+  if (!parentOpenIds.length) return [];
   const out = [];
   let pageToken = '';
   while (true) {
+    const condition = singleEq
+      ? { field: 'parent_department_id', operator: 'eq', value: JSON.stringify(parentOpenIds[0]) }
+      : { field: 'parent_department_id', operator: 'in', value: JSON.stringify(parentOpenIds) };
     const body = {
-      filter: {
-        conditions: [
-          { field: 'parent_department_id', operator: 'eq', value: JSON.stringify(parentOpenId) },
-        ],
-      },
+      filter: { conditions: [condition] },
       required_fields: ['name', 'parent_department_id', 'department_id', 'enabled_status'],
-      page_request: { page_size: 50, ...(pageToken ? { page_token: pageToken } : {}) },
+      page_request: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
     };
     const url = `${FEISHU_FILTER_URL}?department_id_type=open_department_id`;
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (data.code !== 0) throw new Error(`Feishu filter error: ${JSON.stringify(data)}`);
+    if (data.code !== 0) {
+      const err = new Error(`Feishu departments/filter error: ${JSON.stringify(data)}`);
+      err.feishuCode = data.code;
+      throw err;
+    }
     const list = data.data?.departments || [];
     out.push(...list);
     const pr = data.data?.page_response || {};
@@ -60,20 +69,50 @@ async function filterChildren(token, parentOpenId) {
   return out;
 }
 
+// Level-by-level BFS. One request per level (chunked to 50 parents/call),
+// instead of one per node. A typical 4-level org tree → 4 requests.
 async function fetchAllDepartments(token) {
   const all = [];
   const seen = new Set();
-  const queue = ['0'];
-  while (queue.length) {
-    const parent = queue.shift();
-    const children = await filterChildren(token, parent);
-    for (const d of children) {
-      const openId = extractOpenId(d);
-      if (!openId || seen.has(openId)) continue;
-      seen.add(openId);
-      all.push({ raw: d, parentOpenId: parent, openId, enabled: d.enabled_status !== false });
-      if (d.enabled_status !== false) queue.push(openId);
+  let currentLevel = ['0'];
+  let useBatch = true;
+
+  while (currentLevel.length) {
+    const nextLevel = [];
+    const CHUNK = 50;
+
+    for (let i = 0; i < currentLevel.length; i += CHUNK) {
+      const chunk = currentLevel.slice(i, i + CHUNK);
+      let children;
+      if (useBatch) {
+        try {
+          children = await filterChildrenByParents(token, chunk, false);
+        } catch (e) {
+          console.warn('departments filter `in` failed, falling back to per-parent eq:', e.message);
+          useBatch = false;
+        }
+      }
+      if (!useBatch) {
+        children = [];
+        for (const p of chunk) {
+          const partial = await filterChildrenByParents(token, [p], true);
+          children.push(...partial);
+        }
+      }
+
+      for (const d of children) {
+        const openId = extractOpenId(d);
+        if (!openId || seen.has(openId)) continue;
+        seen.add(openId);
+        // Each returned dept carries its own parent_department_id — use it rather
+        // than assuming the chunk parent, because `in` returns a mixed set.
+        const parentOpenId =
+          extractIdValue(d.parent_department_id) || (chunk.length === 1 ? chunk[0] : '0');
+        all.push({ raw: d, parentOpenId, openId, enabled: d.enabled_status !== false });
+        if (d.enabled_status !== false) nextLevel.push(openId);
+      }
     }
+    currentLevel = nextLevel;
   }
   return all;
 }
