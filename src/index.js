@@ -27,24 +27,15 @@ async function getTenantAccessToken(env) {
   return data.tenant_access_token;
 }
 
-// Single-parent variant (fallback only). Uses `eq`, validated in prior runs.
-async function filterChildren(token, parentOpenId) {
-  return filterChildrenByParents(token, [parentOpenId], true);
-}
-
-// Batch-parents variant. `in` operator lets us ask many parents at once so BFS
-// costs one request per tree level instead of one per internal node. Falls back
-// to per-parent `eq` loop if `in` is rejected.
-async function filterChildrenByParents(token, parentOpenIds, singleEq = false) {
-  if (!parentOpenIds.length) return [];
+// Pull every department matching a filter (with pagination). The `enabled_status`
+// field accepts `eq true` which returns ALL enabled depts in one flat list —
+// letting us skip BFS entirely (Feishu rejects `in` on parent_department_id).
+async function filterAllDepartmentsBy(token, field, value) {
   const out = [];
   let pageToken = '';
   while (true) {
-    const condition = singleEq
-      ? { field: 'parent_department_id', operator: 'eq', value: JSON.stringify(parentOpenIds[0]) }
-      : { field: 'parent_department_id', operator: 'in', value: JSON.stringify(parentOpenIds) };
     const body = {
-      filter: { conditions: [condition] },
+      filter: { conditions: [{ field, operator: 'eq', value }] },
       required_fields: ['name', 'parent_department_id', 'department_id', 'enabled_status'],
       page_request: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
     };
@@ -55,13 +46,8 @@ async function filterChildrenByParents(token, parentOpenIds, singleEq = false) {
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (data.code !== 0) {
-      const err = new Error(`Feishu departments/filter error: ${JSON.stringify(data)}`);
-      err.feishuCode = data.code;
-      throw err;
-    }
-    const list = data.data?.departments || [];
-    out.push(...list);
+    if (data.code !== 0) throw new Error(`Feishu departments/filter error: ${JSON.stringify(data)}`);
+    out.push(...(data.data?.departments || []));
     const pr = data.data?.page_response || {};
     if (!pr.has_more || !pr.page_token) break;
     pageToken = pr.page_token;
@@ -69,52 +55,58 @@ async function filterChildrenByParents(token, parentOpenIds, singleEq = false) {
   return out;
 }
 
-// Level-by-level BFS. One request per level (chunked to 50 parents/call),
-// instead of one per node. A typical 4-level org tree → 4 requests.
+// Fetch all enabled departments in one pass, then topologically order them
+// (parents first) so ZKTeco writes never fail with "parent not exist".
 async function fetchAllDepartments(token) {
-  const all = [];
-  const seen = new Set();
-  let currentLevel = ['0'];
-  let useBatch = true;
+  const raw = await filterAllDepartmentsBy(token, 'enabled_status', 'true');
 
-  while (currentLevel.length) {
-    const nextLevel = [];
-    const CHUNK = 50;
-
-    for (let i = 0; i < currentLevel.length; i += CHUNK) {
-      const chunk = currentLevel.slice(i, i + CHUNK);
-      let children;
-      if (useBatch) {
-        try {
-          children = await filterChildrenByParents(token, chunk, false);
-        } catch (e) {
-          console.warn('departments filter `in` failed, falling back to per-parent eq:', e.message);
-          useBatch = false;
-        }
-      }
-      if (!useBatch) {
-        children = [];
-        for (const p of chunk) {
-          const partial = await filterChildrenByParents(token, [p], true);
-          children.push(...partial);
-        }
-      }
-
-      for (const d of children) {
-        const openId = extractOpenId(d);
-        if (!openId || seen.has(openId)) continue;
-        seen.add(openId);
-        // Each returned dept carries its own parent_department_id — use it rather
-        // than assuming the chunk parent, because `in` returns a mixed set.
-        const parentOpenId =
-          extractIdValue(d.parent_department_id) || (chunk.length === 1 ? chunk[0] : '0');
-        all.push({ raw: d, parentOpenId, openId, enabled: d.enabled_status !== false });
-        if (d.enabled_status !== false) nextLevel.push(openId);
-      }
-    }
-    currentLevel = nextLevel;
+  const byOpenId = new Map();
+  const parentOf = new Map();
+  for (const d of raw) {
+    const openId = extractOpenId(d);
+    if (!openId) continue;
+    byOpenId.set(openId, d);
+    parentOf.set(openId, extractIdValue(d.parent_department_id) || '0');
   }
-  return all;
+
+  // Build parent → children adjacency
+  const childrenOf = new Map();
+  for (const [openId, parent] of parentOf) {
+    if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+    childrenOf.get(parent).push(openId);
+  }
+
+  // BFS from root '0' (parents first order)
+  const ordered = [];
+  const visited = new Set();
+  const queue = [...(childrenOf.get('0') || [])];
+  while (queue.length) {
+    const openId = queue.shift();
+    if (visited.has(openId)) continue;
+    visited.add(openId);
+    const d = byOpenId.get(openId);
+    if (!d) continue;
+    ordered.push({
+      raw: d,
+      parentOpenId: parentOf.get(openId) || '0',
+      openId,
+      enabled: true,
+    });
+    queue.push(...(childrenOf.get(openId) || []));
+  }
+
+  // Catch any dept whose parent is missing (e.g. parent was disabled but child wasn't).
+  // Push them at the end under root so they still land somewhere valid.
+  for (const [openId, d] of byOpenId) {
+    if (visited.has(openId)) continue;
+    ordered.push({
+      raw: d,
+      parentOpenId: '0',
+      openId,
+      enabled: true,
+    });
+  }
+  return ordered;
 }
 
 function extractOpenId(dept) {
