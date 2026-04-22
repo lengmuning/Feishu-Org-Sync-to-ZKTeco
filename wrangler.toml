@@ -1,0 +1,15 @@
+name = "feishu-zkteco-sync"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+ROOT_PARENTNUMBER = "111"
+
+# Required secrets (set with `wrangler secret put <NAME>`):
+#   FEISHU_APP_ID
+#   FEISHU_APP_SECRET
+#   ZKTECO_ACCESS_KEY
+#   ZKTECO_BASE_URL
