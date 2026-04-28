@@ -484,6 +484,106 @@ function extractUpdatedCount(msg) {
   return m ? Number(m[1]) : null;
 }
 
+async function handleFeishuWebhook(request, env, ctx) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: 'invalid json' }, { status: 400 });
+  }
+
+  if (body.type === 'url_verification') {
+    if (env.FEISHU_VERIFICATION_TOKEN && body.token !== env.FEISHU_VERIFICATION_TOKEN) {
+      return Response.json({ error: 'invalid token' }, { status: 401 });
+    }
+    return Response.json({ challenge: body.challenge });
+  }
+
+  const headerToken = body.header?.token;
+  if (env.FEISHU_VERIFICATION_TOKEN && headerToken !== env.FEISHU_VERIFICATION_TOKEN) {
+    return Response.json({ error: 'invalid token' }, { status: 401 });
+  }
+
+  const eventType = body.header?.event_type;
+  const event = body.event;
+  if (!eventType || !event) return Response.json({ ok: true, ignored: true });
+
+  ctx.waitUntil(
+    dispatchFeishuEvent(env, eventType, event)
+      .then(() => console.log('webhook ok', eventType, body.header?.event_id))
+      .catch(e => console.error('webhook err', eventType, e.message, e.stack))
+  );
+  return Response.json({ ok: true });
+}
+
+async function dispatchFeishuEvent(env, eventType, event) {
+  const object = event.object || {};
+  switch (eventType) {
+    case 'contact.department.created_v3':
+    case 'contact.department.updated_v3':
+      return handleDepartmentUpsert(env, object);
+    case 'contact.department.deleted_v3':
+      return handleDepartmentDelete(env, object);
+    case 'contact.user.created_v3':
+    case 'contact.user.updated_v3':
+      return handleUserUpsert(env, object);
+    case 'contact.user.deleted_v3':
+      return handleUserDelete(env, object);
+    default:
+      console.log('event ignored', eventType);
+  }
+}
+
+async function handleDepartmentUpsert(env, object) {
+  const openId =
+    extractIdValue(object.open_department_id) || extractIdValue(object.department_id);
+  if (!openId) return;
+  const parentOpenId = extractIdValue(object.parent_department_id) || '0';
+  const rootParent = env.ROOT_PARENTNUMBER || '1';
+  const row = {
+    deptnumber: sanitizeId(openId),
+    deptname: String(extractText(object.name) || '').slice(0, 40),
+    parentnumber: parentOpenId === '0' ? rootParent : sanitizeId(parentOpenId),
+  };
+  if (!row.deptnumber || !row.deptname || !row.parentnumber) return;
+  await pushToZkteco(env, [row]);
+}
+
+async function handleDepartmentDelete(env, object) {
+  const openId =
+    extractIdValue(object.open_department_id) || extractIdValue(object.department_id);
+  if (!openId) return;
+  const deptnumber = sanitizeId(openId);
+  const zkList = await fetchZktecoDepartments(env);
+  const current = zkList.find(d => d.deptnumber === deptnumber);
+  if (!current) return;
+  const currentName = String(current.deptname || '');
+  if (currentName.startsWith(DISABLED_MARK)) return;
+  await pushToZkteco(env, [{ deptnumber, deptname: withDisabledPrefix(currentName) }]);
+}
+
+async function handleUserUpsert(env, object) {
+  const pin = String(object.employee_no || '').trim();
+  if (!pin) return;
+  if (!/^[a-zA-Z0-9]{1,24}$/.test(pin)) return;
+  const name = String(extractText(object.name) || '').trim();
+  if (!name) return;
+  const deptIds = object.department_ids || [];
+  const firstDeptId = extractIdValue(deptIds[0]);
+  if (!firstDeptId) return;
+  const row = {
+    pin,
+    name: name.slice(0, 20),
+    deptnumber: sanitizeId(firstDeptId),
+  };
+  await pushEmployeesToZkteco(env, [row]);
+}
+
+async function handleUserDelete(env, object) {
+  console.log('user deleted in feishu (no zkteco delete performed)',
+    object.employee_no || extractIdValue(object.open_id));
+}
+
 async function feishuFindEmployeeByJobNumber(token, jobNumber) {
   const url = 'https://open.feishu.cn/open-apis/directory/v1/employees/filter?department_id_type=open_department_id&employee_id_type=open_id';
   const body = {
@@ -594,8 +694,11 @@ async function testPerson(env, empno) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === '/feishu/webhook' && request.method === 'POST') {
+      return handleFeishuWebhook(request, env, ctx);
+    }
     if (url.pathname === '/test-person') {
       const empno = url.searchParams.get('empno');
       if (!empno) return Response.json({ error: 'missing ?empno=' }, { status: 400 });
@@ -746,13 +849,14 @@ export default {
     }
     return new Response(
       'Feishu → ZKTeco sync worker\n' +
-      '  GET /preview                       — dry run, depts + users (add ?users=0 to skip users)\n' +
-      '  GET /sync                          — full sync (depts + users)\n' +
-      '  GET /sync-users                    — sync users only\n' +
-      '  GET /test-person?empno=            — single-employee partial-update diff test\n' +
-      '  GET /test-dept-users?name=…        — test one department’s users (add &dry=1 for preview)\n' +
-      '  GET /test-dept-users?openid=…      — same, by open_department_id\n' +
-      '  cron: 0 * * * *                    — auto full sync hourly\n',
+      '  POST /feishu/webhook               — Feishu event subscription endpoint (real-time sync)\n' +
+      '  GET  /preview                      — dry run, depts + users (add ?users=0 to skip users)\n' +
+      '  GET  /sync                         — full sync (depts + users)\n' +
+      '  GET  /sync-users                   — sync users only\n' +
+      '  GET  /test-person?empno=           — single-employee partial-update diff test\n' +
+      '  GET  /test-dept-users?name=…       — test one department’s users (add &dry=1 for preview)\n' +
+      '  GET  /test-dept-users?openid=…     — same, by open_department_id\n' +
+      '  cron: 0 19 * * *                   — fallback full sync, daily 03:00 Asia/Shanghai (UTC 19:00)\n',
       { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
     );
   },
