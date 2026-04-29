@@ -60,8 +60,8 @@ CoreHR 事件只带 `employment_id` / `person_id`，Worker 按以下顺序解析
 
 1. `employment_id` → CoreHR ID convert → `open_id` → **Contact `users/:id` GET**（轻量，~3 subrequest，<1s）
 2. 上一步失败 → fallback 到 Directory 员工索引；只合并**正在进行中**的 Directory 拉取，不缓存旧结果，避免员工异动后复用过期部门
-3. 仍失败 → CoreHR `employees/search` 按 `employment_id` 查
-4. 事件只带 `person_id` → CoreHR `employees/batch_get` 拿到 `employment_id` 后回到第 1 步
+3. 仍失败 → CoreHR `employees/search` 按 `employment_id` 查；如果拿到工号，再用工号查 Directory 员工详情，补齐姓名和部门后同步
+4. 事件只带 `person_id` → CoreHR `employees/batch_get` 拿到 `employment_id` 后回到第 1 步；如果只拿到工号，也会用工号查 Directory 补齐
 
 `tenant_access_token` 做了模块级缓存（TTL 100 分钟，飞书 token 实际 2 小时过期）。Directory 员工数据不做结果缓存；同一个 Worker isolate 内多个 CoreHR 事件并发触发时，会等待同一个 in-flight Directory 拉取 Promise，避免重复消耗 subrequest。
 
