@@ -838,6 +838,17 @@ function extractCoreHrPersonId(object) {
   return findFirstStringByKeys(object, ['person_id', 'personId']);
 }
 
+function extractCoreHrEmployeeNumber(employee) {
+  return String(
+    employee.employee_number ||
+    employee.employment_info?.employee_number ||
+    employee.employment_info?.worker_id ||
+    employee.work_info?.job_number ||
+    findFirstStringByKeys(employee, ['employee_number', 'job_number', 'employee_no', 'worker_id']) ||
+    ''
+  ).trim();
+}
+
 async function feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId) {
   const url = new URL(FEISHU_COREHR_ID_CONVERT_URL);
   url.searchParams.set('id_transform_type', '1');
@@ -912,6 +923,16 @@ async function resolveEmployeeByOpenId(token, openId) {
   return null;
 }
 
+async function resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee) {
+  const jobNumber = extractCoreHrEmployeeNumber(coreHrEmployee);
+  if (!jobNumber) return null;
+  const directoryEmployee = await feishuFindEmployeeByJobNumber(token, jobNumber);
+  if (directoryEmployee) {
+    return { employee: directoryEmployee, source: 'directory.job_number', jobNumber };
+  }
+  return null;
+}
+
 async function feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId) {
   const url = new URL(FEISHU_COREHR_EMPLOYEE_SEARCH_URL);
   url.searchParams.set('page_size', '10');
@@ -976,7 +997,11 @@ async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
     }
 
     const coreHrEmployee = await feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId);
-    if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.search', employmentId };
+    if (coreHrEmployee) {
+      const resolvedByJobNumber = await resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee);
+      if (resolvedByJobNumber) return { ...resolvedByJobNumber, employmentId };
+      return { employee: coreHrEmployee, source: 'corehr.employee.search', employmentId };
+    }
   }
 
   const personId = extractCoreHrPersonId(object);
@@ -991,6 +1016,8 @@ async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
           if (resolved) return { ...resolved, personId, employmentId: eidFromPerson, openId: openIdFromPerson };
         }
       }
+      const resolvedByJobNumber = await resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee);
+      if (resolvedByJobNumber) return { ...resolvedByJobNumber, personId, employmentId: eidFromPerson };
       return { employee: coreHrEmployee, source: 'corehr.employee.batch_get', personId };
     }
   }
