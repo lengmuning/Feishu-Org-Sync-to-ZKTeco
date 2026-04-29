@@ -743,48 +743,18 @@ async function feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId) {
 
 async function feishuFindDirectoryEmployeeByCoreHrId(token, employmentId) {
   const openId = await feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId);
-  const attempts = [
-    ...(openId ? [{
-      employeeIdType: 'open_id',
-      field: 'base_info.employee_id',
-      value: openId,
-    }] : []),
-    {
-      employeeIdType: 'people_corehr_id',
-      field: 'base_info.employee_id',
-      value: employmentId,
-    },
-    {
-      employeeIdType: 'open_id',
-      field: 'base_info.employee_id',
-      value: employmentId,
-    },
-  ];
-  for (const attempt of attempts) {
-    const body = {
-      filter: {
-        conditions: [
-          { field: attempt.field, operator: 'eq', value: JSON.stringify(attempt.value) },
-          { field: 'work_info.staff_status', operator: 'eq', value: '1' },
-        ],
-      },
-      required_fields: EMPLOYEE_REQUIRED_FIELDS,
-      page_request: { page_size: 5 },
-    };
-    const url = `${FEISHU_EMPLOYEES_FILTER_URL}?department_id_type=open_department_id&employee_id_type=${attempt.employeeIdType}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
-    if (data.code === 0 && data.data?.employees?.[0]) return data.data.employees[0];
-    if (data.code !== 0) {
-      console.warn('directory employee lookup failed',
-        attempt.employeeIdType, employmentId, JSON.stringify(data).slice(0, 500));
-    }
+  if (!openId) return null;
+
+  // Directory v1 employees/filter does not support filtering directly by base_info.employee_id.
+  // Reuse the proven full-sync source, then pick the converted open_id from that result set.
+  const depts = await fetchAllDepartments(token);
+  const employees = await fetchAllFeishuEmployees(token, depts.filter(d => d.enabled));
+  const matched = employees.find(e => extractEmployeeKey(e) === openId);
+  if (!matched) {
+    console.warn('directory employee not found after corehr id convert',
+      JSON.stringify({ employmentId, openId }).slice(0, 500));
   }
-  return null;
+  return matched || null;
 }
 
 async function feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId) {
@@ -848,6 +818,18 @@ async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
   const personId = extractCoreHrPersonId(object);
   if (personId) {
     const coreHrEmployee = await feishuCoreHrEmployeeBatchGetByPersonId(token, personId);
+    const employmentIdFromPerson = coreHrEmployee && extractCoreHrEmploymentId(coreHrEmployee);
+    if (employmentIdFromPerson) {
+      const directoryEmployee = await feishuFindDirectoryEmployeeByCoreHrId(token, employmentIdFromPerson);
+      if (directoryEmployee) {
+        return {
+          employee: directoryEmployee,
+          source: 'corehr.employee.batch_get+directory',
+          personId,
+          employmentId: employmentIdFromPerson,
+        };
+      }
+    }
     if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.batch_get', personId };
   }
 
