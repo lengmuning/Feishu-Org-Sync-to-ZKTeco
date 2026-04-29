@@ -2,9 +2,15 @@ const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access
 const FEISHU_FILTER_URL = 'https://open.feishu.cn/open-apis/directory/v1/departments/filter';
 const FEISHU_EMPLOYEES_FILTER_URL = 'https://open.feishu.cn/open-apis/directory/v1/employees/filter';
 const FEISHU_USERS_BY_DEPT_URL = 'https://open.feishu.cn/open-apis/contact/v3/users/find_by_department';
+const FEISHU_CONTACT_USER_GET_URL = 'https://open.feishu.cn/open-apis/contact/v3/users';
 const FEISHU_COREHR_ID_CONVERT_URL = 'https://open.feishu.cn/open-apis/corehr/v1/common_data/id/convert';
 const FEISHU_COREHR_EMPLOYEE_SEARCH_URL = 'https://open.feishu.cn/open-apis/corehr/v2/employees/search';
 const FEISHU_COREHR_EMPLOYEE_BATCH_GET_URL = 'https://open.feishu.cn/open-apis/corehr/v2/employees/batch_get';
+
+const TOKEN_TTL_MS = 100 * 60 * 1000;
+let cachedToken = null;
+let cachedTokenAt = 0;
+let directoryIndexPromise = null;
 
 const EMPLOYEE_REQUIRED_FIELDS = [
   'base_info.employee_id',
@@ -20,8 +26,6 @@ const COREHR_EMPLOYEE_FIELDS = [
   'employment_status',
   'personal_info',
   'employment_info',
-  'job_data',
-  'job_datas',
 ];
 
 const MANAGED_ID_PREFIX = 'od';
@@ -39,6 +43,13 @@ async function getTenantAccessToken(env) {
   const data = await res.json();
   if (data.code !== 0) throw new Error(`Feishu token error: ${JSON.stringify(data)}`);
   return data.tenant_access_token;
+}
+
+async function getCachedTenantToken(env) {
+  if (cachedToken && Date.now() - cachedTokenAt < TOKEN_TTL_MS) return cachedToken;
+  cachedToken = await getTenantAccessToken(env);
+  cachedTokenAt = Date.now();
+  return cachedToken;
 }
 
 // Pull every department matching a filter (with pagination). The `enabled_status`
@@ -148,16 +159,16 @@ function extractText(value) {
   if (value && typeof value === 'object') {
     const i18nText = Object.values(value.i18n_value || {}).map(extractText).find(Boolean);
     const candidates = [
-      value.default_value,
-      value.name,
-      value.full_name,
-      value.local_name,
-      value.display_name,
-      value.value,
-      value.zh_cn,
-      value['zh-CN'],
-      value.en,
-      value['en-US'],
+      value.default_value ||
+      value.name ||
+      value.full_name ||
+      value.local_name ||
+      value.display_name ||
+      value.value ||
+      value.zh_cn ||
+      value['zh-CN'] ||
+      value.en ||
+      value['en-US'] ||
       i18nText,
     ];
     for (const candidate of candidates) {
@@ -384,7 +395,7 @@ async function fetchFeishuEmployeesByDept(token, deptOpenId) {
   return out;
 }
 
-async function fetchAllFeishuEmployees(token, enabledDepts) {
+async function fetchAllFeishuEmployees(token, enabledDepts, { allowPerDeptFallback = true } = {}) {
   const byEmployeeId = new Map();
   const ids = enabledDepts.map(d => d.openId).filter(Boolean);
   if (!ids.length) return [];
@@ -410,6 +421,10 @@ async function fetchAllFeishuEmployees(token, enabledDepts) {
       }
     }
   } catch (e) {
+    if (!allowPerDeptFallback) {
+      console.warn('batch employees filter failed, per-dept fallback disabled:', e.message);
+      throw e;
+    }
     console.warn('batch employees filter failed, falling back to per-dept:', e.message);
     useBatch = false;
     byEmployeeId.clear();
@@ -486,13 +501,7 @@ function mapEmployeeToZktecoRow(employee) {
   if (!/^[a-zA-Z0-9]{1,24}$/.test(pin)) return { skipped: { reason: 'invalid_pin_format', pin, name } };
   if (!name) return { skipped: { reason: 'no_name', pin } };
   if (!deptnumber) return { skipped: { reason: 'no_department', pin, name } };
-  return {
-    row: {
-      pin,
-      name: name.slice(0, 20),
-      deptnumber,
-    },
-  };
+  return { row: { pin, name: name.slice(0, 20), deptnumber } };
 }
 
 function mapEmployeesToZkteco(employees) {
@@ -585,290 +594,6 @@ function extractUpdatedCount(msg) {
   if (typeof msg !== 'string') return null;
   const m = msg.match(/成功(\d+)条/);
   return m ? Number(m[1]) : null;
-}
-
-async function handleFeishuWebhook(request, env, ctx) {
-  let body;
-  try {
-    body = await request.json();
-  } catch {
-    return Response.json({ error: 'invalid json' }, { status: 400 });
-  }
-
-  if (body.type === 'url_verification') {
-    if (env.FEISHU_VERIFICATION_TOKEN && body.token !== env.FEISHU_VERIFICATION_TOKEN) {
-      return Response.json({ error: 'invalid token' }, { status: 401 });
-    }
-    return Response.json({ challenge: body.challenge });
-  }
-
-  const headerToken = body.header?.token;
-  if (env.FEISHU_VERIFICATION_TOKEN && headerToken !== env.FEISHU_VERIFICATION_TOKEN) {
-    return Response.json({ error: 'invalid token' }, { status: 401 });
-  }
-
-  const eventType = body.header?.event_type;
-  const event = body.event;
-  if (!eventType || !event) return Response.json({ ok: true, ignored: true });
-
-  ctx.waitUntil(
-    dispatchFeishuEvent(env, eventType, event)
-      .then(() => console.log('webhook ok', eventType, body.header?.event_id))
-      .catch(e => console.error('webhook err', eventType, e.message, e.stack))
-  );
-  return Response.json({ ok: true });
-}
-
-async function dispatchFeishuEvent(env, eventType, event) {
-  const object = event.object || event || {};
-  switch (eventType) {
-    case 'contact.department.created_v3':
-    case 'contact.department.updated_v3':
-      return handleDepartmentUpsert(env, object);
-    case 'contact.department.deleted_v3':
-      return handleDepartmentDelete(env, object);
-    case 'contact.user.created_v3':
-    case 'contact.user.updated_v3':
-      return handleUserUpsert(env, object);
-    case 'contact.user.deleted_v3':
-      return handleUserDelete(env, object);
-    case 'corehr.job_data.employed_v1':
-    case 'corehr.job_data.changed_v1':
-    case 'corehr.person.updated_v1':
-      return handleCoreHrEmployeeUpsert(env, eventType, object);
-    case 'corehr.employment.resigned_v1':
-      return handleCoreHrEmploymentResigned(eventType, object);
-    default:
-      console.log('event ignored', eventType);
-  }
-}
-
-async function handleDepartmentUpsert(env, object) {
-  const openId =
-    extractIdValue(object.open_department_id) || extractIdValue(object.department_id);
-  if (!openId) return;
-  const parentOpenId = extractIdValue(object.parent_department_id) || '0';
-  const rootParent = env.ROOT_PARENTNUMBER || '1';
-  const row = {
-    deptnumber: sanitizeId(openId),
-    deptname: String(extractText(object.name) || '').slice(0, 40),
-    parentnumber: parentOpenId === '0' ? rootParent : sanitizeId(parentOpenId),
-  };
-  if (!row.deptnumber || !row.deptname || !row.parentnumber) return;
-  await pushToZkteco(env, [row]);
-}
-
-async function handleDepartmentDelete(env, object) {
-  const openId =
-    extractIdValue(object.open_department_id) || extractIdValue(object.department_id);
-  if (!openId) return;
-  const deptnumber = sanitizeId(openId);
-  const zkList = await fetchZktecoDepartments(env);
-  const current = zkList.find(d => d.deptnumber === deptnumber);
-  if (!current) return;
-  const currentName = String(current.deptname || '');
-  if (currentName.startsWith(DISABLED_MARK)) return;
-  await pushToZkteco(env, [{ deptnumber, deptname: withDisabledPrefix(currentName) }]);
-}
-
-async function handleUserUpsert(env, object) {
-  const pin = String(object.employee_no || '').trim();
-  if (!pin) return;
-  if (!/^[a-zA-Z0-9]{1,24}$/.test(pin)) return;
-  const name = String(extractText(object.name) || '').trim();
-  if (!name) return;
-  const deptIds = object.department_ids || [];
-  const firstDeptId = extractIdValue(deptIds[0]);
-  if (!firstDeptId) return;
-  const row = {
-    pin,
-    name: name.slice(0, 20),
-    deptnumber: sanitizeId(firstDeptId),
-  };
-  await pushEmployeesToZkteco(env, [row]);
-}
-
-async function handleUserDelete(env, object) {
-  console.log('user deleted in feishu (no zkteco delete performed)',
-    object.employee_no || extractIdValue(object.open_id));
-}
-
-function extractCoreHrEmploymentId(object) {
-  return findFirstStringByKeys(object, [
-    'employment_id',
-    'employmentId',
-    'employee_id',
-    'employeeId',
-    'user_id',
-    'userId',
-  ]);
-}
-
-function extractCoreHrPersonId(object) {
-  return findFirstStringByKeys(object, [
-    'person_id',
-    'personId',
-  ]);
-}
-
-async function feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId) {
-  const url = new URL(FEISHU_COREHR_ID_CONVERT_URL);
-  url.searchParams.set('id_transform_type', '1');
-  url.searchParams.set('id_type', 'user_id');
-  url.searchParams.set('feishu_user_id_type', 'open_id');
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ ids: [employmentId] }),
-  });
-  const data = await res.json();
-  if (data.code !== 0) {
-    console.warn('corehr id convert failed', employmentId, JSON.stringify(data).slice(0, 500));
-    return '';
-  }
-
-  const preferred = findFirstStringByKeys(data.data, [
-    'target_id',
-    'targetId',
-    'open_id',
-    'openId',
-    'converted_id',
-    'convertedId',
-  ]);
-  if (preferred && preferred !== employmentId) return preferred;
-
-  const strings = collectStrings(data.data);
-  return strings.find(s => s !== employmentId && s.startsWith('ou_')) || '';
-}
-
-async function feishuFindDirectoryEmployeeByCoreHrId(token, employmentId) {
-  const openId = await feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId);
-  if (!openId) return null;
-
-  // Directory v1 employees/filter does not support filtering directly by base_info.employee_id.
-  // Reuse the proven full-sync source, then pick the converted open_id from that result set.
-  const depts = await fetchAllDepartments(token);
-  const employees = await fetchAllFeishuEmployees(token, depts.filter(d => d.enabled));
-  const matched = employees.find(e => extractEmployeeKey(e) === openId);
-  if (!matched) {
-    console.warn('directory employee not found after corehr id convert',
-      JSON.stringify({ employmentId, openId }).slice(0, 500));
-  }
-  return matched || null;
-}
-
-async function feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId) {
-  const url = new URL(FEISHU_COREHR_EMPLOYEE_SEARCH_URL);
-  url.searchParams.set('page_size', '10');
-  url.searchParams.set('user_id_type', 'people_corehr_id');
-  url.searchParams.set('department_id_type', 'open_department_id');
-  const body = {
-    fields: COREHR_EMPLOYEE_FIELDS,
-    employment_id_list: [employmentId],
-    employment_status: 'hired',
-  };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (data.code !== 0) throw new Error(`Feishu corehr employee/search error: ${JSON.stringify(data)}`);
-  const list = data.data?.items || data.data?.employees || data.data?.employee_list || [];
-  return list[0] || null;
-}
-
-async function feishuCoreHrEmployeeBatchGetByPersonId(token, personId) {
-  const url = new URL(FEISHU_COREHR_EMPLOYEE_BATCH_GET_URL);
-  url.searchParams.set('user_id_type', 'people_corehr_id');
-  url.searchParams.set('department_id_type', 'open_department_id');
-  const body = {
-    fields: COREHR_EMPLOYEE_FIELDS,
-    person_ids: [personId],
-  };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  if (data.code !== 0) throw new Error(`Feishu corehr employee/batch_get error: ${JSON.stringify(data)}`);
-  const list = data.data?.items || data.data?.employees || data.data?.employee_list || [];
-  const hired = list.find(e => {
-    const status = String(
-      e.employment_status ||
-      e.employment_info?.employment_status ||
-      findFirstStringByKeys(e, ['employment_status', 'status'])
-    ).toLowerCase();
-    return !status || status === 'hired' || status === 'active' || status === '1';
-  });
-  return hired || list[0] || null;
-}
-
-async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
-  const employmentId = extractCoreHrEmploymentId(object);
-  if (employmentId) {
-    const directoryEmployee = await feishuFindDirectoryEmployeeByCoreHrId(token, employmentId);
-    if (directoryEmployee) return { employee: directoryEmployee, source: 'directory', employmentId };
-
-    const coreHrEmployee = await feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId);
-    if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.search', employmentId };
-  }
-
-  const personId = extractCoreHrPersonId(object);
-  if (personId) {
-    const coreHrEmployee = await feishuCoreHrEmployeeBatchGetByPersonId(token, personId);
-    const employmentIdFromPerson = coreHrEmployee && extractCoreHrEmploymentId(coreHrEmployee);
-    if (employmentIdFromPerson) {
-      const directoryEmployee = await feishuFindDirectoryEmployeeByCoreHrId(token, employmentIdFromPerson);
-      if (directoryEmployee) {
-        return {
-          employee: directoryEmployee,
-          source: 'corehr.employee.batch_get+directory',
-          personId,
-          employmentId: employmentIdFromPerson,
-        };
-      }
-    }
-    if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.batch_get', personId };
-  }
-
-  console.warn('corehr event has no resolvable employee',
-    eventType,
-    JSON.stringify({ employmentId, personId, object }).slice(0, 1000));
-  return null;
-}
-
-async function handleCoreHrEmployeeUpsert(env, eventType, object) {
-  const token = await getTenantAccessToken(env);
-  const found = await feishuFindEmployeeFromCoreHrEvent(token, eventType, object);
-  if (!found?.employee) return;
-
-  const mapped = mapEmployeeToZktecoRow(found.employee);
-  if (!mapped.row) {
-    console.warn('corehr employee skipped',
-      eventType,
-      found.source,
-      JSON.stringify(mapped.skipped || {}).slice(0, 500),
-      JSON.stringify(found.employee).slice(0, 1000));
-    return;
-  }
-
-  const result = await pushEmployeesToZkteco(env, [mapped.row]);
-  console.log('corehr employee upserted',
-    eventType,
-    found.source,
-    JSON.stringify(mapped.row),
-    JSON.stringify(result).slice(0, 1000));
-}
-
-async function handleCoreHrEmploymentResigned(eventType, object) {
-  console.log('corehr employment resigned (no zkteco delete performed)',
-    eventType,
-    JSON.stringify({
-      employment_id: extractCoreHrEmploymentId(object),
-      person_id: extractCoreHrPersonId(object),
-    }));
 }
 
 async function feishuFindEmployeeByJobNumber(token, jobNumber) {
@@ -980,11 +705,336 @@ async function testPerson(env, empno) {
   };
 }
 
+async function handleFeishuWebhook(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: 'invalid json' }, { status: 400 });
+  }
+
+  if (body.type === 'url_verification') {
+    if (env.FEISHU_VERIFICATION_TOKEN && body.token !== env.FEISHU_VERIFICATION_TOKEN) {
+      return Response.json({ error: 'invalid token' }, { status: 401 });
+    }
+    return Response.json({ challenge: body.challenge });
+  }
+
+  const headerToken = body.header?.token;
+  if (env.FEISHU_VERIFICATION_TOKEN && headerToken !== env.FEISHU_VERIFICATION_TOKEN) {
+    return Response.json({ error: 'invalid token' }, { status: 401 });
+  }
+
+  const eventType = body.header?.event_type;
+  const eventId = body.header?.event_id || '';
+  const event = body.event;
+  if (!eventType || !event) return Response.json({ ok: true, ignored: true });
+
+  const started = Date.now();
+  try {
+    const result = await dispatchFeishuEvent(env, eventType, event);
+    console.log('webhook ok', eventType, eventId, JSON.stringify({
+      durationMs: Date.now() - started,
+      result,
+    }).slice(0, 1000));
+    return Response.json({ ok: true, result });
+  } catch (e) {
+    console.error('webhook err', eventType, eventId, e.message, e.stack);
+    return Response.json({ ok: false, error: e.message }, { status: 500 });
+  }
+}
+
+async function dispatchFeishuEvent(env, eventType, event) {
+  const object = event.object || event || {};
+  switch (eventType) {
+    case 'contact.department.created_v3':
+    case 'contact.department.updated_v3':
+      return handleDepartmentUpsert(env, object);
+    case 'contact.department.deleted_v3':
+      return handleDepartmentDelete(env, object);
+    case 'contact.user.created_v3':
+    case 'contact.user.updated_v3':
+      return handleUserUpsert(env, object);
+    case 'contact.user.deleted_v3':
+      return handleUserDelete(env, object);
+    case 'corehr.job_data.employed_v1':
+    case 'corehr.job_data.changed_v1':
+    case 'corehr.person.updated_v1':
+      return handleCoreHrEmployeeUpsert(env, eventType, object);
+    case 'corehr.employment.resigned_v1':
+      return handleCoreHrEmploymentResigned(eventType, object);
+    default:
+      console.log('event ignored', eventType);
+      return { ignored: true, eventType };
+  }
+}
+
+async function handleDepartmentUpsert(env, object) {
+  const openId =
+    extractIdValue(object.open_department_id) || extractIdValue(object.department_id);
+  if (!openId) return { skipped: 'missing_department_id' };
+  const parentOpenId = extractIdValue(object.parent_department_id) || '0';
+  const rootParent = env.ROOT_PARENTNUMBER || '1';
+  const row = {
+    deptnumber: sanitizeId(openId),
+    deptname: String(extractText(object.name) || '').slice(0, 40),
+    parentnumber: parentOpenId === '0' ? rootParent : sanitizeId(parentOpenId),
+  };
+  if (!row.deptnumber || !row.deptname || !row.parentnumber) {
+    return { skipped: 'incomplete_department_row', row };
+  }
+  const pushResults = await pushToZkteco(env, [row]);
+  assertZktecoPushOk(pushResults, 'department upsert');
+  return { action: 'department_upsert', row, pushResults };
+}
+
+async function handleDepartmentDelete(env, object) {
+  const openId =
+    extractIdValue(object.open_department_id) || extractIdValue(object.department_id);
+  if (!openId) return { skipped: 'missing_department_id' };
+  const deptnumber = sanitizeId(openId);
+  const zkList = await fetchZktecoDepartments(env);
+  const current = zkList.find(d => d.deptnumber === deptnumber);
+  if (!current) return { skipped: 'department_not_found_in_zkteco', deptnumber };
+  const currentName = String(current.deptname || '');
+  if (currentName.startsWith(DISABLED_MARK)) return { skipped: 'already_disabled', deptnumber };
+  const row = { deptnumber, deptname: withDisabledPrefix(currentName) };
+  const pushResults = await pushToZkteco(env, [row]);
+  assertZktecoPushOk(pushResults, 'department delete mark');
+  return { action: 'department_mark_disabled', row, pushResults };
+}
+
+async function handleUserUpsert(env, object) {
+  const mapped = mapEmployeeToZktecoRow(object);
+  if (!mapped.row) return { skipped: mapped.skipped };
+  const pushResults = await pushEmployeesToZkteco(env, [mapped.row]);
+  assertZktecoPushOk(pushResults, 'contact user upsert');
+  return { action: 'user_upsert', source: 'contact.event', row: mapped.row, pushResults };
+}
+
+async function handleUserDelete(env, object) {
+  const employee = object.employee_no || extractIdValue(object.open_id);
+  console.log('user deleted in feishu (no zkteco delete performed)', employee);
+  return { action: 'user_delete_log_only', employee };
+}
+
+function assertZktecoPushOk(pushResults, label) {
+  const failed = pushResults.filter(r => r.status !== 200 || r.body?.ret !== 0);
+  if (failed.length) throw new Error(`${label} zkteco push failed: ${JSON.stringify(failed).slice(0, 1000)}`);
+}
+
+function extractCoreHrEmploymentId(object) {
+  return findFirstStringByKeys(object, [
+    'employment_id',
+    'employmentId',
+    'employee_id',
+    'employeeId',
+    'user_id',
+    'userId',
+  ]);
+}
+
+function extractCoreHrPersonId(object) {
+  return findFirstStringByKeys(object, ['person_id', 'personId']);
+}
+
+async function feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId) {
+  const url = new URL(FEISHU_COREHR_ID_CONVERT_URL);
+  url.searchParams.set('id_transform_type', '1');
+  url.searchParams.set('id_type', 'user_id');
+  url.searchParams.set('feishu_user_id_type', 'open_id');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ids: [employmentId] }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.warn('corehr id convert failed', employmentId, JSON.stringify(data).slice(0, 500));
+    return '';
+  }
+  const preferred = findFirstStringByKeys(data.data, [
+    'target_id',
+    'targetId',
+    'open_id',
+    'openId',
+    'converted_id',
+    'convertedId',
+  ]);
+  if (preferred && preferred !== employmentId && preferred.startsWith('ou_')) return preferred;
+  const strings = collectStrings(data.data);
+  return strings.find(s => s !== employmentId && s.startsWith('ou_')) || '';
+}
+
+async function feishuFetchContactUserByOpenId(token, openId) {
+  if (!openId) return null;
+  const url = new URL(`${FEISHU_CONTACT_USER_GET_URL}/${encodeURIComponent(openId)}`);
+  url.searchParams.set('user_id_type', 'open_id');
+  url.searchParams.set('department_id_type', 'open_department_id');
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.warn('contact user lookup failed', openId, JSON.stringify(data).slice(0, 500));
+    return null;
+  }
+  return data.data?.user || null;
+}
+
+async function getDirectoryEmployeeIndex(token) {
+  if (directoryIndexPromise) return directoryIndexPromise;
+  directoryIndexPromise = buildDirectoryEmployeeIndex(token)
+    .finally(() => { directoryIndexPromise = null; });
+  return directoryIndexPromise;
+}
+
+async function buildDirectoryEmployeeIndex(token) {
+  const depts = await fetchAllDepartments(token);
+  const employees = await fetchAllFeishuEmployees(token, depts.filter(d => d.enabled), {
+    allowPerDeptFallback: false,
+  });
+  const byKey = new Map();
+  for (const e of employees) {
+    const key = extractEmployeeKey(e);
+    if (key) byKey.set(key, e);
+  }
+  return { employees, byKey };
+}
+
+async function resolveEmployeeByOpenId(token, openId) {
+  const contactUser = await feishuFetchContactUserByOpenId(token, openId);
+  if (contactUser) return { employee: contactUser, source: 'contact.users.get' };
+
+  const { byKey } = await getDirectoryEmployeeIndex(token);
+  const directoryEmployee = byKey.get(openId);
+  if (directoryEmployee) return { employee: directoryEmployee, source: 'directory.inflight_index' };
+  return null;
+}
+
+async function feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId) {
+  const url = new URL(FEISHU_COREHR_EMPLOYEE_SEARCH_URL);
+  url.searchParams.set('page_size', '10');
+  url.searchParams.set('user_id_type', 'people_corehr_id');
+  url.searchParams.set('department_id_type', 'open_department_id');
+  const body = {
+    fields: COREHR_EMPLOYEE_FIELDS,
+    employment_id_list: [employmentId],
+    employment_status: 'hired',
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.warn('corehr employee/search failed', employmentId, JSON.stringify(data).slice(0, 500));
+    return null;
+  }
+  const list = data.data?.items || data.data?.employees || data.data?.employee_list || [];
+  return list[0] || null;
+}
+
+async function feishuCoreHrEmployeeBatchGetByPersonId(token, personId) {
+  const url = new URL(FEISHU_COREHR_EMPLOYEE_BATCH_GET_URL);
+  url.searchParams.set('user_id_type', 'people_corehr_id');
+  url.searchParams.set('department_id_type', 'open_department_id');
+  const body = {
+    fields: COREHR_EMPLOYEE_FIELDS,
+    person_ids: [personId],
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.warn('corehr employee/batch_get failed', personId, JSON.stringify(data).slice(0, 500));
+    return null;
+  }
+  const list = data.data?.items || data.data?.employees || data.data?.employee_list || [];
+  const hired = list.find(e => {
+    const status = String(
+      e.employment_status ||
+      e.employment_info?.employment_status ||
+      findFirstStringByKeys(e, ['employment_status', 'status'])
+    ).toLowerCase();
+    return !status || status === 'hired' || status === 'active' || status === '1';
+  });
+  return hired || list[0] || null;
+}
+
+async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
+  const employmentId = extractCoreHrEmploymentId(object);
+  if (employmentId) {
+    const openId = await feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId);
+    if (openId) {
+      const resolved = await resolveEmployeeByOpenId(token, openId);
+      if (resolved) return { ...resolved, employmentId, openId };
+    }
+
+    const coreHrEmployee = await feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId);
+    if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.search', employmentId };
+  }
+
+  const personId = extractCoreHrPersonId(object);
+  if (personId) {
+    const coreHrEmployee = await feishuCoreHrEmployeeBatchGetByPersonId(token, personId);
+    if (coreHrEmployee) {
+      const eidFromPerson = extractCoreHrEmploymentId(coreHrEmployee);
+      if (eidFromPerson) {
+        const openIdFromPerson = await feishuConvertCoreHrEmploymentIdToOpenId(token, eidFromPerson);
+        if (openIdFromPerson) {
+          const resolved = await resolveEmployeeByOpenId(token, openIdFromPerson);
+          if (resolved) return { ...resolved, personId, employmentId: eidFromPerson, openId: openIdFromPerson };
+        }
+      }
+      return { employee: coreHrEmployee, source: 'corehr.employee.batch_get', personId };
+    }
+  }
+
+  console.warn('corehr event has no resolvable employee',
+    eventType,
+    JSON.stringify({ employmentId, personId, object }).slice(0, 1000));
+  return null;
+}
+
+async function handleCoreHrEmployeeUpsert(env, eventType, object) {
+  const token = await getCachedTenantToken(env);
+  const found = await feishuFindEmployeeFromCoreHrEvent(token, eventType, object);
+  if (!found?.employee) throw new Error(`CoreHR employee not resolved for ${eventType}`);
+
+  const mapped = mapEmployeeToZktecoRow(found.employee);
+  if (!mapped.row) throw new Error(`CoreHR employee skipped: ${JSON.stringify(mapped.skipped || {}).slice(0, 500)}`);
+
+  const pushResults = await pushEmployeesToZkteco(env, [mapped.row]);
+  assertZktecoPushOk(pushResults, 'corehr employee upsert');
+  console.log('corehr employee upserted',
+    eventType,
+    found.source,
+    JSON.stringify(mapped.row),
+    JSON.stringify(pushResults).slice(0, 1000));
+  return { action: 'corehr_employee_upsert', source: found.source, row: mapped.row, pushResults };
+}
+
+async function handleCoreHrEmploymentResigned(eventType, object) {
+  const result = {
+    action: 'corehr_resigned_log_only',
+    eventType,
+    employment_id: extractCoreHrEmploymentId(object),
+    person_id: extractCoreHrPersonId(object),
+  };
+  console.log('corehr employment resigned (no zkteco delete performed)', JSON.stringify(result));
+  return result;
+}
+
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/feishu/webhook' && request.method === 'POST') {
-      return handleFeishuWebhook(request, env, ctx);
+      return handleFeishuWebhook(request, env);
     }
     if (url.pathname === '/test-person') {
       const empno = url.searchParams.get('empno');
@@ -1136,7 +1186,7 @@ export default {
     }
     return new Response(
       'Feishu → ZKTeco sync worker\n' +
-      '  POST /feishu/webhook               — Feishu event subscription endpoint (contact + corehr real-time sync)\n' +
+      '  POST /feishu/webhook               — Feishu event subscription endpoint (sync ACK after ZKTeco update)\n' +
       '  GET  /preview                      — dry run, depts + users (add ?users=0 to skip users)\n' +
       '  GET  /sync                         — full sync (depts + users)\n' +
       '  GET  /sync-users                   — sync users only\n' +
