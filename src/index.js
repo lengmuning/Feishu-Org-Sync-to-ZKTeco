@@ -2,12 +2,26 @@ const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access
 const FEISHU_FILTER_URL = 'https://open.feishu.cn/open-apis/directory/v1/departments/filter';
 const FEISHU_EMPLOYEES_FILTER_URL = 'https://open.feishu.cn/open-apis/directory/v1/employees/filter';
 const FEISHU_USERS_BY_DEPT_URL = 'https://open.feishu.cn/open-apis/contact/v3/users/find_by_department';
+const FEISHU_COREHR_ID_CONVERT_URL = 'https://open.feishu.cn/open-apis/corehr/v1/common_data/id/convert';
+const FEISHU_COREHR_EMPLOYEE_SEARCH_URL = 'https://open.feishu.cn/open-apis/corehr/v2/employees/search';
+const FEISHU_COREHR_EMPLOYEE_BATCH_GET_URL = 'https://open.feishu.cn/open-apis/corehr/v2/employees/batch_get';
 
 const EMPLOYEE_REQUIRED_FIELDS = [
   'base_info.employee_id',
   'base_info.name.name',
   'base_info.departments',
   'work_info.job_number',
+];
+
+const COREHR_EMPLOYEE_FIELDS = [
+  'employment_id',
+  'person_id',
+  'employee_number',
+  'employment_status',
+  'personal_info',
+  'employment_info',
+  'job_data',
+  'job_datas',
 ];
 
 const MANAGED_ID_PREFIX = 'od';
@@ -127,17 +141,74 @@ function extractIdValue(value) {
 
 function extractText(value) {
   if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    const first = value.map(extractText).find(Boolean);
+    return first || '';
+  }
   if (value && typeof value === 'object') {
-    return (
-      value.default_value ||
-      value.name ||
-      value.zh_cn ||
-      value.en ||
-      Object.values(value.i18n_value || {})[0] ||
-      ''
-    );
+    const i18nText = Object.values(value.i18n_value || {}).map(extractText).find(Boolean);
+    const candidates = [
+      value.default_value,
+      value.name,
+      value.full_name,
+      value.local_name,
+      value.display_name,
+      value.value,
+      value.zh_cn,
+      value['zh-CN'],
+      value.en,
+      value['en-US'],
+      i18nText,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate) return candidate;
+      if (candidate && typeof candidate === 'object') {
+        const text = extractText(candidate);
+        if (text) return text;
+      }
+    }
   }
   return '';
+}
+
+function findFirstStringByKeys(value, keys, depth = 0) {
+  if (!value || depth > 8) return '';
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findFirstStringByKeys(item, keys, depth + 1);
+      if (found) return found;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') return '';
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+    const id = extractIdValue(candidate);
+    if (id) return id;
+  }
+  for (const child of Object.values(value)) {
+    if (!child || typeof child !== 'object') continue;
+    const found = findFirstStringByKeys(child, keys, depth + 1);
+    if (found) return found;
+  }
+  return '';
+}
+
+function collectStrings(value, out = [], depth = 0) {
+  if (!value || depth > 8) return out;
+  if (typeof value === 'string') {
+    if (value.trim()) out.push(value.trim());
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out, depth + 1);
+    return out;
+  }
+  if (typeof value === 'object') {
+    for (const child of Object.values(value)) collectStrings(child, out, depth + 1);
+  }
+  return out;
 }
 
 function sanitizeId(id) {
@@ -371,7 +442,15 @@ function extractEmployeeKey(employee) {
 }
 
 function extractEmployeeName(employee) {
-  return extractText(employee.base_info?.name?.name || employee.base_info?.name || employee.name);
+  return extractText(
+    employee.base_info?.name?.name ||
+    employee.base_info?.name ||
+    employee.personal_info?.name_list ||
+    employee.personal_info?.name ||
+    employee.employment_info?.name ||
+    employee.name_list ||
+    employee.name
+  );
 }
 
 function extractEmployeeDeptOpenId(employee) {
@@ -379,26 +458,50 @@ function extractEmployeeDeptOpenId(employee) {
   if (Array.isArray(employee.department_ids) && employee.department_ids[0]) return extractIdValue(employee.department_ids[0]);
   const depts = employee.base_info?.departments || [];
   const dept = depts.find(d => d.is_primary || d.is_main) || depts[0];
-  return extractIdValue(dept?.department_id) || extractIdValue(dept?.open_department_id);
+  return (
+    extractIdValue(dept?.department_id) ||
+    extractIdValue(dept?.open_department_id) ||
+    findFirstStringByKeys(employee, [
+      'open_department_id',
+      'department_id',
+      'main_department_id',
+      'primary_department_id',
+    ])
+  );
+}
+
+function mapEmployeeToZktecoRow(employee) {
+  const pin = String(
+    employee.work_info?.job_number ||
+    employee.employee_number ||
+    employee.employee_no ||
+    employee.employment_info?.employee_number ||
+    employee.employment_info?.worker_id ||
+    findFirstStringByKeys(employee, ['job_number', 'employee_number', 'employee_no', 'worker_id']) ||
+    ''
+  ).trim();
+  const name = extractEmployeeName(employee).trim();
+  const deptnumber = sanitizeId(extractEmployeeDeptOpenId(employee));
+  if (!pin) return { skipped: { reason: 'no_job_number', name, employee_id: extractEmployeeKey(employee) } };
+  if (!/^[a-zA-Z0-9]{1,24}$/.test(pin)) return { skipped: { reason: 'invalid_pin_format', pin, name } };
+  if (!name) return { skipped: { reason: 'no_name', pin } };
+  if (!deptnumber) return { skipped: { reason: 'no_department', pin, name } };
+  return {
+    row: {
+      pin,
+      name: name.slice(0, 20),
+      deptnumber,
+    },
+  };
 }
 
 function mapEmployeesToZkteco(employees) {
   const rows = [];
   const skipped = [];
   for (const e of employees) {
-    const pin = String(e.work_info?.job_number || e.employee_no || '').trim();
-    const name = extractEmployeeName(e).trim();
-    const deptOpenId = extractEmployeeDeptOpenId(e);
-    const deptnumber = sanitizeId(deptOpenId);
-    if (!pin) { skipped.push({ reason: 'no_job_number', name, employee_id: extractEmployeeKey(e) }); continue; }
-    if (!/^[a-zA-Z0-9]{1,24}$/.test(pin)) { skipped.push({ reason: 'invalid_pin_format', pin, name }); continue; }
-    if (!name) { skipped.push({ reason: 'no_name', pin }); continue; }
-    if (!deptnumber) { skipped.push({ reason: 'no_department', pin, name }); continue; }
-    rows.push({
-      pin,
-      name: name.slice(0, 20),
-      deptnumber,
-    });
+    const mapped = mapEmployeeToZktecoRow(e);
+    if (mapped.row) rows.push(mapped.row);
+    else skipped.push(mapped.skipped);
   }
   return { rows, skipped };
 }
@@ -517,7 +620,7 @@ async function handleFeishuWebhook(request, env, ctx) {
 }
 
 async function dispatchFeishuEvent(env, eventType, event) {
-  const object = event.object || {};
+  const object = event.object || event || {};
   switch (eventType) {
     case 'contact.department.created_v3':
     case 'contact.department.updated_v3':
@@ -529,6 +632,12 @@ async function dispatchFeishuEvent(env, eventType, event) {
       return handleUserUpsert(env, object);
     case 'contact.user.deleted_v3':
       return handleUserDelete(env, object);
+    case 'corehr.job_data.employed_v1':
+    case 'corehr.job_data.changed_v1':
+    case 'corehr.person.updated_v1':
+      return handleCoreHrEmployeeUpsert(env, eventType, object);
+    case 'corehr.employment.resigned_v1':
+      return handleCoreHrEmploymentResigned(eventType, object);
     default:
       console.log('event ignored', eventType);
   }
@@ -582,6 +691,202 @@ async function handleUserUpsert(env, object) {
 async function handleUserDelete(env, object) {
   console.log('user deleted in feishu (no zkteco delete performed)',
     object.employee_no || extractIdValue(object.open_id));
+}
+
+function extractCoreHrEmploymentId(object) {
+  return findFirstStringByKeys(object, [
+    'employment_id',
+    'employmentId',
+    'employee_id',
+    'employeeId',
+    'user_id',
+    'userId',
+  ]);
+}
+
+function extractCoreHrPersonId(object) {
+  return findFirstStringByKeys(object, [
+    'person_id',
+    'personId',
+  ]);
+}
+
+async function feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId) {
+  const url = new URL(FEISHU_COREHR_ID_CONVERT_URL);
+  url.searchParams.set('id_transform_type', '1');
+  url.searchParams.set('id_type', 'user_id');
+  url.searchParams.set('feishu_user_id_type', 'open_id');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ids: [employmentId] }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    console.warn('corehr id convert failed', employmentId, JSON.stringify(data).slice(0, 500));
+    return '';
+  }
+
+  const preferred = findFirstStringByKeys(data.data, [
+    'target_id',
+    'targetId',
+    'open_id',
+    'openId',
+    'converted_id',
+    'convertedId',
+  ]);
+  if (preferred && preferred !== employmentId) return preferred;
+
+  const strings = collectStrings(data.data);
+  return strings.find(s => s !== employmentId && s.startsWith('ou_')) || '';
+}
+
+async function feishuFindDirectoryEmployeeByCoreHrId(token, employmentId) {
+  const openId = await feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId);
+  const attempts = [
+    ...(openId ? [{
+      employeeIdType: 'open_id',
+      field: 'base_info.employee_id',
+      value: openId,
+    }] : []),
+    {
+      employeeIdType: 'people_corehr_id',
+      field: 'base_info.employee_id',
+      value: employmentId,
+    },
+    {
+      employeeIdType: 'open_id',
+      field: 'base_info.employee_id',
+      value: employmentId,
+    },
+  ];
+  for (const attempt of attempts) {
+    const body = {
+      filter: {
+        conditions: [
+          { field: attempt.field, operator: 'eq', value: JSON.stringify(attempt.value) },
+          { field: 'work_info.staff_status', operator: 'eq', value: '1' },
+        ],
+      },
+      required_fields: EMPLOYEE_REQUIRED_FIELDS,
+      page_request: { page_size: 5 },
+    };
+    const url = `${FEISHU_EMPLOYEES_FILTER_URL}?department_id_type=open_department_id&employee_id_type=${attempt.employeeIdType}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.code === 0 && data.data?.employees?.[0]) return data.data.employees[0];
+    if (data.code !== 0) {
+      console.warn('directory employee lookup failed',
+        attempt.employeeIdType, employmentId, JSON.stringify(data).slice(0, 500));
+    }
+  }
+  return null;
+}
+
+async function feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId) {
+  const url = new URL(FEISHU_COREHR_EMPLOYEE_SEARCH_URL);
+  url.searchParams.set('page_size', '10');
+  url.searchParams.set('user_id_type', 'people_corehr_id');
+  url.searchParams.set('department_id_type', 'open_department_id');
+  const body = {
+    fields: COREHR_EMPLOYEE_FIELDS,
+    employment_id_list: [employmentId],
+    employment_status: 'hired',
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.code !== 0) throw new Error(`Feishu corehr employee/search error: ${JSON.stringify(data)}`);
+  const list = data.data?.items || data.data?.employees || data.data?.employee_list || [];
+  return list[0] || null;
+}
+
+async function feishuCoreHrEmployeeBatchGetByPersonId(token, personId) {
+  const url = new URL(FEISHU_COREHR_EMPLOYEE_BATCH_GET_URL);
+  url.searchParams.set('user_id_type', 'people_corehr_id');
+  url.searchParams.set('department_id_type', 'open_department_id');
+  const body = {
+    fields: COREHR_EMPLOYEE_FIELDS,
+    person_ids: [personId],
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.code !== 0) throw new Error(`Feishu corehr employee/batch_get error: ${JSON.stringify(data)}`);
+  const list = data.data?.items || data.data?.employees || data.data?.employee_list || [];
+  const hired = list.find(e => {
+    const status = String(
+      e.employment_status ||
+      e.employment_info?.employment_status ||
+      findFirstStringByKeys(e, ['employment_status', 'status'])
+    ).toLowerCase();
+    return !status || status === 'hired' || status === 'active' || status === '1';
+  });
+  return hired || list[0] || null;
+}
+
+async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
+  const employmentId = extractCoreHrEmploymentId(object);
+  if (employmentId) {
+    const directoryEmployee = await feishuFindDirectoryEmployeeByCoreHrId(token, employmentId);
+    if (directoryEmployee) return { employee: directoryEmployee, source: 'directory', employmentId };
+
+    const coreHrEmployee = await feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId);
+    if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.search', employmentId };
+  }
+
+  const personId = extractCoreHrPersonId(object);
+  if (personId) {
+    const coreHrEmployee = await feishuCoreHrEmployeeBatchGetByPersonId(token, personId);
+    if (coreHrEmployee) return { employee: coreHrEmployee, source: 'corehr.employee.batch_get', personId };
+  }
+
+  console.warn('corehr event has no resolvable employee',
+    eventType,
+    JSON.stringify({ employmentId, personId, object }).slice(0, 1000));
+  return null;
+}
+
+async function handleCoreHrEmployeeUpsert(env, eventType, object) {
+  const token = await getTenantAccessToken(env);
+  const found = await feishuFindEmployeeFromCoreHrEvent(token, eventType, object);
+  if (!found?.employee) return;
+
+  const mapped = mapEmployeeToZktecoRow(found.employee);
+  if (!mapped.row) {
+    console.warn('corehr employee skipped',
+      eventType,
+      found.source,
+      JSON.stringify(mapped.skipped || {}).slice(0, 500),
+      JSON.stringify(found.employee).slice(0, 1000));
+    return;
+  }
+
+  const result = await pushEmployeesToZkteco(env, [mapped.row]);
+  console.log('corehr employee upserted',
+    eventType,
+    found.source,
+    JSON.stringify(mapped.row),
+    JSON.stringify(result).slice(0, 1000));
+}
+
+async function handleCoreHrEmploymentResigned(eventType, object) {
+  console.log('corehr employment resigned (no zkteco delete performed)',
+    eventType,
+    JSON.stringify({
+      employment_id: extractCoreHrEmploymentId(object),
+      person_id: extractCoreHrPersonId(object),
+    }));
 }
 
 async function feishuFindEmployeeByJobNumber(token, jobNumber) {
@@ -849,7 +1154,7 @@ export default {
     }
     return new Response(
       'Feishu → ZKTeco sync worker\n' +
-      '  POST /feishu/webhook               — Feishu event subscription endpoint (real-time sync)\n' +
+      '  POST /feishu/webhook               — Feishu event subscription endpoint (contact + corehr real-time sync)\n' +
       '  GET  /preview                      — dry run, depts + users (add ?users=0 to skip users)\n' +
       '  GET  /sync                         — full sync (depts + users)\n' +
       '  GET  /sync-users                   — sync users only\n' +
