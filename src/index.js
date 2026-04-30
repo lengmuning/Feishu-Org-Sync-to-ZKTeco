@@ -26,6 +26,17 @@ const COREHR_EMPLOYEE_FIELDS = [
   'employment_status',
   'personal_info',
   'employment_info',
+  'job_data',
+  'job_datas',
+];
+
+const COREHR_EMPLOYEE_FIELDS_BASE = [
+  'employment_id',
+  'person_id',
+  'employee_number',
+  'employment_status',
+  'personal_info',
+  'employment_info',
 ];
 
 const MANAGED_ID_PREFIX = 'od';
@@ -159,16 +170,16 @@ function extractText(value) {
   if (value && typeof value === 'object') {
     const i18nText = Object.values(value.i18n_value || {}).map(extractText).find(Boolean);
     const candidates = [
-      value.default_value ||
-      value.name ||
-      value.full_name ||
-      value.local_name ||
-      value.display_name ||
-      value.value ||
-      value.zh_cn ||
-      value['zh-CN'] ||
-      value.en ||
-      value['en-US'] ||
+      value.default_value,
+      value.name,
+      value.full_name,
+      value.local_name,
+      value.display_name,
+      value.value,
+      value.zh_cn,
+      value['zh-CN'],
+      value.en,
+      value['en-US'],
       i18nText,
     ];
     for (const candidate of candidates) {
@@ -938,17 +949,30 @@ async function feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId) {
   url.searchParams.set('page_size', '10');
   url.searchParams.set('user_id_type', 'people_corehr_id');
   url.searchParams.set('department_id_type', 'open_department_id');
-  const body = {
-    fields: COREHR_EMPLOYEE_FIELDS,
+  const buildBody = fields => ({
+    fields,
     employment_id_list: [employmentId],
     employment_status: 'hired',
-  };
+  });
+  let body = buildBody(COREHR_EMPLOYEE_FIELDS);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  let data = await res.json();
+  if (data.code !== 0 && shouldRetryCoreHrBaseFields(data)) {
+    console.warn('corehr employee/search extended fields failed, retrying base fields',
+      employmentId,
+      JSON.stringify(data).slice(0, 500));
+    body = buildBody(COREHR_EMPLOYEE_FIELDS_BASE);
+    const retryRes = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    data = await retryRes.json();
+  }
   if (data.code !== 0) {
     console.warn('corehr employee/search failed', employmentId, JSON.stringify(data).slice(0, 500));
     return null;
@@ -961,16 +985,29 @@ async function feishuCoreHrEmployeeBatchGetByPersonId(token, personId) {
   const url = new URL(FEISHU_COREHR_EMPLOYEE_BATCH_GET_URL);
   url.searchParams.set('user_id_type', 'people_corehr_id');
   url.searchParams.set('department_id_type', 'open_department_id');
-  const body = {
-    fields: COREHR_EMPLOYEE_FIELDS,
+  const buildBody = fields => ({
+    fields,
     person_ids: [personId],
-  };
+  });
+  let body = buildBody(COREHR_EMPLOYEE_FIELDS);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  let data = await res.json();
+  if (data.code !== 0 && shouldRetryCoreHrBaseFields(data)) {
+    console.warn('corehr employee/batch_get extended fields failed, retrying base fields',
+      personId,
+      JSON.stringify(data).slice(0, 500));
+    body = buildBody(COREHR_EMPLOYEE_FIELDS_BASE);
+    const retryRes = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    data = await retryRes.json();
+  }
   if (data.code !== 0) {
     console.warn('corehr employee/batch_get failed', personId, JSON.stringify(data).slice(0, 500));
     return null;
@@ -987,19 +1024,29 @@ async function feishuCoreHrEmployeeBatchGetByPersonId(token, personId) {
   return hired || list[0] || null;
 }
 
+function shouldRetryCoreHrBaseFields(data) {
+  return (
+    data?.code === 99992402 ||
+    String(data?.msg || '').toLowerCase().includes('field')
+  );
+}
+
 async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
   const employmentId = extractCoreHrEmploymentId(object);
   if (employmentId) {
+    const coreHrEmployee = await feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId);
+    if (coreHrEmployee) {
+      const resolvedByJobNumber = await resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee);
+      if (resolvedByJobNumber) return { ...resolvedByJobNumber, employmentId };
+    }
+
     const openId = await feishuConvertCoreHrEmploymentIdToOpenId(token, employmentId);
     if (openId) {
       const resolved = await resolveEmployeeByOpenId(token, openId);
       if (resolved) return { ...resolved, employmentId, openId };
     }
 
-    const coreHrEmployee = await feishuCoreHrEmployeeSearchByEmploymentId(token, employmentId);
     if (coreHrEmployee) {
-      const resolvedByJobNumber = await resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee);
-      if (resolvedByJobNumber) return { ...resolvedByJobNumber, employmentId };
       return { employee: coreHrEmployee, source: 'corehr.employee.search', employmentId };
     }
   }
@@ -1009,6 +1056,8 @@ async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
     const coreHrEmployee = await feishuCoreHrEmployeeBatchGetByPersonId(token, personId);
     if (coreHrEmployee) {
       const eidFromPerson = extractCoreHrEmploymentId(coreHrEmployee);
+      const resolvedByJobNumber = await resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee);
+      if (resolvedByJobNumber) return { ...resolvedByJobNumber, personId, employmentId: eidFromPerson };
       if (eidFromPerson) {
         const openIdFromPerson = await feishuConvertCoreHrEmploymentIdToOpenId(token, eidFromPerson);
         if (openIdFromPerson) {
@@ -1016,8 +1065,6 @@ async function feishuFindEmployeeFromCoreHrEvent(token, eventType, object) {
           if (resolved) return { ...resolved, personId, employmentId: eidFromPerson, openId: openIdFromPerson };
         }
       }
-      const resolvedByJobNumber = await resolveEmployeeByCoreHrEmployeeNumber(token, coreHrEmployee);
-      if (resolvedByJobNumber) return { ...resolvedByJobNumber, personId, employmentId: eidFromPerson };
       return { employee: coreHrEmployee, source: 'corehr.employee.batch_get', personId };
     }
   }
