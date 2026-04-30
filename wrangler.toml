@@ -1,4 +1,4 @@
-name = "feishu-zkteco-sync"
+name = "feishu-org-sync-to-zkteco"
 main = "src/index.js"
 compatibility_date = "2025-01-01"
 
